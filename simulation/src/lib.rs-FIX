@@ -1,0 +1,554 @@
+use nalgebra::{Isometry3, Point3, Translation3, UnitQuaternion, Vector3};
+
+use ncollide3d::shape::{Ball, Cuboid, ShapeHandle};
+use nphysics3d::force_generator::DefaultForceGeneratorSet;
+use nphysics3d::joint::DefaultJointConstraintSet;
+use nphysics3d::math::Velocity;
+use nphysics3d::object::{BodyPartHandle, DefaultBodyHandle, DefaultBodySet, DefaultColliderSet};
+use nphysics3d::world::{DefaultGeometricalWorld, DefaultMechanicalWorld};
+
+use nphysics3d::joint::{FixedJoint, FreeJoint, RevoluteJoint};
+use nphysics3d::object::{ColliderDesc, Ground, MultibodyDesc};
+
+use map::*;
+use protocol::map::Map;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EngineStickyState {
+    Ok,
+    Stuck(i32),
+    Recovering(i32),
+}
+
+impl EngineStickyState {
+    pub fn new() -> Self {
+        EngineStickyState::Ok
+    }
+
+    pub fn max_stuck_iterations(self) -> i32 {
+        3
+    }
+    pub fn max_recovering_iterations(self) -> i32 {
+        120
+    }
+
+    pub fn must_recover(self) -> bool {
+        self == EngineStickyState::Recovering(0)
+    }
+
+    pub fn handle_stuck_status(self, is_stuck: bool) -> Self {
+        if is_stuck {
+            match self {
+                EngineStickyState::Ok => {
+                    println!("Entering stuck state");
+                    EngineStickyState::Stuck(0)
+                }
+                EngineStickyState::Stuck(count) => {
+                    if count < self.max_stuck_iterations() {
+                        println!("-------- stuck state {}", count);
+                        EngineStickyState::Stuck(count + 1)
+                    } else {
+                        println!("Entering recovering state");
+                        EngineStickyState::Recovering(0)
+                    }
+                }
+                EngineStickyState::Recovering(count) => {
+                    if count < self.max_recovering_iterations() {
+                        EngineStickyState::Recovering(count + 1)
+                    } else {
+                        EngineStickyState::Ok
+                    }
+                }
+            }
+        } else {
+            EngineStickyState::Ok
+        }
+    }
+}
+
+pub type SimN = f64;
+
+pub struct SimulatedWorld {
+    mechanical_world: DefaultMechanicalWorld<SimN>,
+    geometrical_world: DefaultGeometricalWorld<SimN>,
+    bodies: DefaultBodySet<SimN>,
+    colliders: DefaultColliderSet<SimN>,
+    joint_constraints: DefaultJointConstraintSet<SimN>,
+    force_generators: DefaultForceGeneratorSet<SimN>,
+
+    ground: DefaultBodyHandle,
+    ground_part_count: usize,
+
+    car: DefaultBodyHandle,
+
+    car_part_id_body: usize,
+    car_part_id_bl: usize,
+    car_part_id_br: usize,
+    car_part_id_fl: usize,
+    car_part_id_fr: usize,
+    car_motor_power_bl: SimN,
+    car_motor_power_br: SimN,
+    car_motor_power_fl: SimN,
+    car_motor_power_fr: SimN,
+
+    motor_stall_torque: SimN,
+    motor_max_speed: SimN,
+
+    sticky_state: EngineStickyState,
+}
+
+const COLLIDER_MARGIN: SimN = 0.015;
+
+fn cuboid(l: SimN, w: SimN, h: SimN) -> ColliderDesc<SimN> {
+    ColliderDesc::new(ShapeHandle::new(Cuboid::new(NaV3Sim::new(
+        (l / 2.0) - COLLIDER_MARGIN,
+        (w / 2.0) - COLLIDER_MARGIN,
+        (h / 2.0) - COLLIDER_MARGIN,
+    ))))
+    .density(1.1)
+    .margin(COLLIDER_MARGIN)
+}
+
+fn cuboid_without_margin(l: SimN, w: SimN, h: SimN) -> ColliderDesc<SimN> {
+    ColliderDesc::new(ShapeHandle::new(Cuboid::new(NaV3Sim::new(
+        l / 2.0,
+        w / 2.0,
+        h / 2.0,
+    ))))
+    .density(1.1)
+    .margin(COLLIDER_MARGIN)
+}
+
+fn ball(r: SimN) -> ColliderDesc<SimN> {
+    ColliderDesc::new(ShapeHandle::new(Ball::new(r - COLLIDER_MARGIN)))
+        .density(1.1)
+        .margin(COLLIDER_MARGIN)
+}
+
+fn isometry_zero() -> Isometry3<SimN> {
+    Isometry3::from_parts(
+        Translation3::from(NaV3Sim::zeros()),
+        UnitQuaternion::new(NaV3Sim::zeros()),
+    )
+}
+
+fn isometry_xyz(x: SimN, y: SimN, z: SimN) -> Isometry3<SimN> {
+    Isometry3::from_parts(
+        Translation3::from(NaV3Sim::new(x, y, z)),
+        UnitQuaternion::new(NaV3Sim::zeros()),
+    )
+}
+
+const WHEEL_DISPLACEMENT_Z: SimN =
+    (CAR_LENGTH as SimN / 2.0) - (CAR_WHEEL_RADIUS as SimN + CAR_WHEEL_SPACE as SimN);
+const WHEEL_DISPLACEMENT_X: SimN = (CAR_WIDTH as SimN / 2.0) + CAR_WHEEL_SPACE as SimN;
+const BODY_LENGTH: SimN = CAR_LENGTH as SimN;
+const BODY_WIDTH: SimN = CAR_WIDTH as SimN - 2.0 * (CAR_WHEEL_RADIUS as SimN);
+const BODY_HEIGHT: SimN = CAR_WHEEL_RADIUS as SimN;
+const GROUND_THICKNESS: SimN = 0.1;
+
+fn wheel_joint(angular_velocity: SimN) -> RevoluteJoint<SimN> {
+    let mut joint = RevoluteJoint::new(NaV3Sim::x_axis(), 0.0);
+    joint.enable_angular_motor();
+    joint.set_desired_angular_motor_velocity(angular_velocity);
+    joint
+}
+
+const MOTOR_STALL_TORQUE: SimN = 0.4 / 3.0;
+const MOTOR_MAX_RPM: SimN = 220.0 * 3.0;
+
+impl SimulatedWorld {
+    pub fn new() -> Self {
+        let mut mechanical_world = DefaultMechanicalWorld::new(NaV3Sim::new(0.0, -9.81, 0.0));
+        let mut bodies = DefaultBodySet::new();
+        let mut colliders: DefaultColliderSet<SimN> = DefaultColliderSet::new();
+        let joint_constraints = DefaultJointConstraintSet::new();
+
+        let mut car_root_desc =
+            MultibodyDesc::new(FreeJoint::new(isometry_xyz(0.0, 0.4, 0.0))).name("car".to_owned());
+
+        car_root_desc
+            .add_child(FixedJoint::new(isometry_zero()))
+            .set_name("body".to_owned());
+        car_root_desc
+            .add_child(wheel_joint(1.0))
+            .set_name("bl".to_owned())
+            .set_parent_shift(NaV3Sim::new(
+                WHEEL_DISPLACEMENT_X,
+                0.0,
+                -WHEEL_DISPLACEMENT_Z,
+            ));
+        car_root_desc
+            .add_child(wheel_joint(2.0))
+            .set_name("br".to_owned())
+            .set_parent_shift(NaV3Sim::new(
+                -WHEEL_DISPLACEMENT_X,
+                0.0,
+                -WHEEL_DISPLACEMENT_Z,
+            ));
+        car_root_desc
+            .add_child(wheel_joint(1.0))
+            .set_name("fl".to_owned())
+            .set_parent_shift(NaV3Sim::new(
+                WHEEL_DISPLACEMENT_X,
+                0.0,
+                WHEEL_DISPLACEMENT_Z,
+            ));
+        car_root_desc
+            .add_child(wheel_joint(2.0))
+            .set_name("fr".to_owned())
+            .set_parent_shift(NaV3Sim::new(
+                -WHEEL_DISPLACEMENT_X,
+                0.0,
+                WHEEL_DISPLACEMENT_Z,
+            ));
+
+        let car_multibody = car_root_desc.build();
+        let car_part_id_body = car_multibody
+            .links_with_name("body")
+            .last()
+            .unwrap()
+            .1
+            .link_id();
+        let car_part_id_bl = car_multibody
+            .links_with_name("bl")
+            .last()
+            .unwrap()
+            .1
+            .link_id();
+        let car_part_id_br = car_multibody
+            .links_with_name("br")
+            .last()
+            .unwrap()
+            .1
+            .link_id();
+        let car_part_id_fl = car_multibody
+            .links_with_name("fl")
+            .last()
+            .unwrap()
+            .1
+            .link_id();
+        let car_part_id_fr = car_multibody
+            .links_with_name("fr")
+            .last()
+            .unwrap()
+            .1
+            .link_id();
+        let car_root = bodies.insert(car_multibody);
+
+        colliders.insert(
+            cuboid(BODY_WIDTH, BODY_HEIGHT, BODY_LENGTH)
+                .build(BodyPartHandle(car_root, car_part_id_body)),
+        );
+        colliders
+            .insert(ball(CAR_WHEEL_RADIUS as SimN).build(BodyPartHandle(car_root, car_part_id_bl)));
+        colliders
+            .insert(ball(CAR_WHEEL_RADIUS as SimN).build(BodyPartHandle(car_root, car_part_id_br)));
+        colliders
+            .insert(ball(CAR_WHEEL_RADIUS as SimN).build(BodyPartHandle(car_root, car_part_id_fl)));
+        colliders
+            .insert(ball(CAR_WHEEL_RADIUS as SimN).build(BodyPartHandle(car_root, car_part_id_fr)));
+
+        let ground_shape = ShapeHandle::new(Cuboid::new(NaV3Sim::new(6.0, GROUND_THICKNESS, 6.0)));
+        let ground = bodies.insert(Ground::new());
+        let ground_collider = ColliderDesc::new(ground_shape)
+            .translation(NaV3Sim::y() * -GROUND_THICKNESS)
+            .build(BodyPartHandle(ground, 0));
+        colliders.insert(ground_collider);
+
+        mechanical_world.set_timestep(1.0 / 120.0);
+        let ip = &mut mechanical_world.integration_parameters;
+        ip.erp = 0.8;
+        ip.allowed_linear_error = 0.0001;
+        ip.allowed_angular_error = 0.0001;
+        ip.max_velocity_iterations = 20;
+        ip.max_position_iterations = 10;
+
+        SimulatedWorld {
+            mechanical_world,
+            geometrical_world: DefaultGeometricalWorld::new(),
+            bodies,
+            colliders,
+            joint_constraints,
+            force_generators: DefaultForceGeneratorSet::new(),
+
+            ground,
+            ground_part_count: 1,
+
+            car: car_root,
+            car_part_id_body,
+            car_part_id_bl,
+            car_part_id_br,
+            car_part_id_fl,
+            car_part_id_fr,
+            car_motor_power_bl: 0.0,
+            car_motor_power_br: 0.0,
+            car_motor_power_fl: 0.0,
+            car_motor_power_fr: 0.0,
+
+            motor_stall_torque: MOTOR_STALL_TORQUE,
+            motor_max_speed: (360.0 * MOTOR_MAX_RPM / 60.0).to_radians(),
+
+            sticky_state: EngineStickyState::new(),
+        }
+    }
+
+    pub fn car_body(&self) -> BodyPartHandle<DefaultBodyHandle> {
+        BodyPartHandle(self.car, self.car_part_id_body)
+    }
+    pub fn car_wheel_bl(&self) -> BodyPartHandle<DefaultBodyHandle> {
+        BodyPartHandle(self.car, self.car_part_id_bl)
+    }
+    pub fn car_wheel_br(&self) -> BodyPartHandle<DefaultBodyHandle> {
+        BodyPartHandle(self.car, self.car_part_id_br)
+    }
+    pub fn car_wheel_fl(&self) -> BodyPartHandle<DefaultBodyHandle> {
+        BodyPartHandle(self.car, self.car_part_id_fl)
+    }
+    pub fn car_wheel_fr(&self) -> BodyPartHandle<DefaultBodyHandle> {
+        BodyPartHandle(self.car, self.car_part_id_fr)
+    }
+
+    pub fn body_position(&self) -> ISO {
+        let car = self.bodies.get(self.car).unwrap();
+        let body = car.part(self.car_part_id_body).unwrap();
+        let pos = body.position();
+        ISO::from_parts(
+            Translation3::from(NaV3::new(
+                pos.translation.x as f32,
+                pos.translation.y as f32,
+                pos.translation.z as f32,
+            )),
+            NaQ::new(NaV3::new(
+                pos.rotation[0] as f32,
+                pos.rotation[1] as f32,
+                pos.rotation[2] as f32,
+            )),
+        )
+    }
+
+    fn wheel_rotation(&self, wheel_part_id: usize) -> f32 {
+        let car = self.bodies.get(self.car).unwrap();
+        let body = car.part(self.car_part_id_body).unwrap();
+        let wheel = car.part(wheel_part_id).unwrap();
+        let body_rot = body.position().rotation;
+        let wheel_rot = wheel.position().rotation;
+        let wheel_rot = body_rot.inverse() * wheel_rot;
+        wheel_rot.rot_x() as f32
+    }
+    pub fn wheel_rotation_bl(&self) -> f32 {
+        self.wheel_rotation(self.car_part_id_bl)
+    }
+    pub fn wheel_rotation_br(&self) -> f32 {
+        self.wheel_rotation(self.car_part_id_br)
+    }
+    pub fn wheel_rotation_fl(&self) -> f32 {
+        self.wheel_rotation(self.car_part_id_fl)
+    }
+    pub fn wheel_rotation_fr(&self) -> f32 {
+        self.wheel_rotation(self.car_part_id_fr)
+    }
+
+    fn wheel_velocity(&self, wheel_part_id: usize) -> f32 {
+        let car = self.bodies.get(self.car).unwrap();
+        let body = car.part(self.car_part_id_body).unwrap();
+        let wheel = car.part(wheel_part_id).unwrap();
+        let body_velocity = body.velocity().angular;
+        let wheel_velocity = wheel.velocity().angular;
+        let wheel_velocity = wheel_velocity - body_velocity;
+        wheel_velocity.x as f32
+    }
+    pub fn wheel_velocity_bl(&self) -> f32 {
+        self.wheel_velocity(self.car_part_id_bl)
+    }
+    pub fn wheel_velocity_br(&self) -> f32 {
+        self.wheel_velocity(self.car_part_id_br)
+    }
+    pub fn wheel_velocity_fl(&self) -> f32 {
+        self.wheel_velocity(self.car_part_id_fl)
+    }
+    pub fn wheel_velocity_fr(&self) -> f32 {
+        self.wheel_velocity(self.car_part_id_fr)
+    }
+
+    /*
+    fn power_ratio(&self, velocity: SimN) -> SimN {
+        let reduction = velocity / self.motor_max_speed;
+        let reduction = if reduction > 1.0 { 1.0 } else { reduction };
+        1.0 - reduction
+    }
+
+    fn apply_wheel_power(&mut self, wheel_part_id: usize, power: f32) {
+        let velocity = self.wheel_velocity(wheel_part_id);
+        let (target_velocity, max_torque) = if power > 0.0 {
+            (
+                self.motor_max_speed * power,
+                if velocity > 0.0 {
+                    self.motor_stall_torque // * self.power_ratio(velocity)
+                } else {
+                    self.motor_stall_torque
+                },
+            )
+        } else if power < 0.0 {
+            (
+                self.motor_max_speed * power,
+                if velocity < 0.0 {
+                    self.motor_stall_torque // * self.power_ratio(-velocity)
+                } else {
+                    self.motor_stall_torque
+                },
+            )
+        } else {
+            (0.0, self.motor_stall_torque)
+        };
+        let car = self.bodies.multibody_mut(self.car).unwrap();
+        let link = car.link_mut(wheel_part_id).unwrap();
+        let joint = link.joint_mut();
+        let joint = joint.downcast_mut::<RevoluteJoint<f32>>().unwrap();
+        joint.set_desired_angular_motor_velocity(target_velocity);
+        joint.set_max_angular_motor_torque(max_torque);
+    }
+    */
+    fn apply_wheel_power(&mut self, wheel_part_id: usize, power: SimN) {
+        let car = self.bodies.multibody_mut(self.car).unwrap();
+        let link = car.link_mut(wheel_part_id).unwrap();
+        let joint = link.joint_mut();
+        let joint = joint.downcast_mut::<RevoluteJoint<SimN>>().unwrap();
+        if power.abs() > 0.05 {
+            let target_velocity = self.motor_max_speed * power;
+            let max_torque = self.motor_stall_torque * power;
+            if !joint.is_angular_motor_enabled() {
+                joint.enable_angular_motor();
+            }
+            joint.set_desired_angular_motor_velocity(target_velocity);
+            joint.set_max_angular_motor_torque(max_torque);
+        } else {
+            if joint.is_angular_motor_enabled() {
+                joint.disable_angular_motor();
+            }
+        }
+    }
+
+    fn apply_power(&mut self) {
+        self.apply_wheel_power(self.car_part_id_bl, self.car_motor_power_bl);
+        self.apply_wheel_power(self.car_part_id_br, self.car_motor_power_br);
+        self.apply_wheel_power(self.car_part_id_fl, self.car_motor_power_fl);
+        self.apply_wheel_power(self.car_part_id_fr, self.car_motor_power_fr);
+    }
+
+    pub fn set_motor_power(&mut self, bl: f32, br: f32, fl: f32, fr: f32) {
+        self.car_motor_power_bl = bl as SimN;
+        self.car_motor_power_br = br as SimN;
+        self.car_motor_power_fl = fl as SimN;
+        self.car_motor_power_fr = fr as SimN;
+    }
+
+    pub fn has_power(&self) -> bool {
+        self.car_motor_power_bl != 0.0
+            || self.car_motor_power_br != 0.0
+            || self.car_motor_power_fl != 0.0
+            || self.car_motor_power_fr != 0.0
+    }
+
+    pub fn wheels_are_stopped(&self) -> bool {
+        self.wheel_velocity_bl().abs() < 0.001
+            && self.wheel_velocity_br().abs() < 0.001
+            && self.wheel_velocity_fl().abs() < 0.001
+            && self.wheel_velocity_fr().abs() < 0.001
+    }
+    pub fn is_stuck(&self) -> bool {
+        self.has_power() && self.wheels_are_stopped()
+    }
+
+    pub fn handle_sticky_motors(&mut self) {
+        self.sticky_state = self.sticky_state.handle_stuck_status(self.is_stuck());
+        if self.sticky_state.must_recover() {
+            self.recover_stuck_state();
+        }
+    }
+
+    pub fn recover_stuck_state(&mut self) {
+        let car = self.bodies.multibody_mut(self.car).unwrap();
+        let link = car.link_mut(0).unwrap();
+        let joint = link.joint_mut();
+        let joint = joint.downcast_mut::<FreeJoint<SimN>>().unwrap();
+        // joint.apply_displacement(&[0.0, 0.01, 0.0, 0.0, 0.0, 0.0]);
+        // joint.apply_displacement(Velocity::linear(0.0, 0.01, 0.0));
+        // let car = self.bodies.get_mut(self.car).unwrap();
+        // car.apply_displacement(&[0.0, 0.01, 0.0, 0.0, 0.0, 0.0]);
+    }
+
+    fn next_ground_part_count(&mut self) -> usize {
+        self.ground_part_count += 1;
+        self.ground_part_count
+    }
+
+    fn add_map_box(&mut self, section_box: &map::MapSectionBox) {
+        let translation = NaV3Sim::new(
+            section_box.center.x as SimN,
+            section_box.center.y as SimN,
+            section_box.center.z as SimN,
+        );
+        let rotation = section_box.rotation;
+        let mut box_collider_desc = cuboid_without_margin(
+            section_box.width as SimN,
+            section_box.height as SimN,
+            section_box.length as SimN,
+        )
+        .translation(translation);
+        if let Some(axis) = rotation.axis() {
+            box_collider_desc = box_collider_desc.rotation(
+                rotation.angle() as SimN
+                    * NaV3Sim::new(axis.x as SimN, axis.y as SimN, axis.z as SimN),
+            );
+        }
+        let box_collider =
+            box_collider_desc.build(BodyPartHandle(self.ground, self.next_ground_part_count()));
+        self.colliders.insert(box_collider);
+    }
+
+    pub fn setup_map(&mut self, map: &Map) {
+        let segments = map_segmentation(map);
+        for segment in segments.iter() {
+            self.add_map_box(&segment.floor_box());
+            self.add_map_box(&segment.left_box());
+            self.add_map_box(&segment.right_box());
+        }
+    }
+
+    pub fn step(&mut self) {
+        self.apply_power();
+        self.handle_sticky_motors();
+        self.mechanical_world.step(
+            &mut self.geometrical_world,
+            &mut self.bodies,
+            &mut self.colliders,
+            &mut self.joint_constraints,
+            &mut self.force_generators,
+        );
+    }
+
+    /*
+    pub fn run_testbed(self) {
+        use nphysics_testbed3d::Testbed;
+
+        let mut testbed = Testbed::new_empty();
+        // Tell the testbed your ground has an handle equal to `ground_handle`.
+        // This will make it be drawn in gray.
+        testbed.set_ground_handle(Some(self.ground));
+        // Provide to the testbed all the components of our physics simulation.
+        testbed.set_world(
+            self.mechanical_world,
+            self.geometrical_world,
+            self.bodies,
+            self.colliders,
+            self.joint_constraints,
+            self.force_generators,
+        );
+        // Adjust the initial camera pose.
+        testbed.look_at(Point3::new(0.0, 1.0, -1.0), Point3::new(0.0, 0.0, 0.0));
+
+        testbed.run();
+    }
+    */
+}

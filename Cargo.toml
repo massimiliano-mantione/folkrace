@@ -1,0 +1,11 @@
+[workspace]
+
+members = [
+    "bot",
+    "display",
+    "hal",
+    "map",
+    "protocol",
+    "simulation",
+    "simulator",
+]

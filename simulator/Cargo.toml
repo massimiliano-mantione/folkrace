@@ -1,0 +1,15 @@
+[package]
+name = "simulator"
+version = "0.1.0"
+authors = ["Massimiliano Mantione <massimiliano.mantione@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bot = {path = "../bot"}
+hal = {path = "../hal"}
+map = {path = "../map"}
+protocol = {path = "../protocol"}
+display = {path = "../display"}
+simulation = {path = "../simulation"}

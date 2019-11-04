@@ -1,0 +1,12 @@
+[package]
+name = "bot"
+version = "0.1.0"
+authors = ["Massimiliano Mantione <massimiliano.mantione@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+hal = {path="../hal"}
+protocol = {path="../protocol"}
+vek = "0.9.9"
